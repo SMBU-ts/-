@@ -53,10 +53,13 @@ WINDOWS = ("expanding", "sliding")
 class ExperimentConfig:
     data_dir: Path
     output_dir: Path
-    train_size: int = 2880
-    test_size: int = 720
-    sliding_size: int = 720
-    maxlags: int = 10
+    train_size: int = 3240
+    test_size: int = 360
+    forecast_horizon: int = 1
+    retrain_interval: int = 1
+    sliding_size: int = 360
+    maxlags: int = 15
+    vecm_deterministic: str = "n"
     seed: int = 42
     max_files: Optional[int] = None
     test_steps: Optional[int] = None
@@ -151,26 +154,61 @@ def select_var_lag(history: np.ndarray, maxlags: int) -> int:
         return 1
 
 
-def forecast_var_one_step(history: np.ndarray, maxlags: int) -> np.ndarray:
-    lag_order = select_var_lag(history, maxlags)
+def fit_var_model(history: np.ndarray, maxlags: int):
+    diff_history = np.diff(history, axis=0)
+    lag_order = select_var_lag(diff_history, maxlags)
     try:
-        fit = VAR(history).fit(lag_order)
-        return np.asarray(fit.forecast(history[-lag_order:], steps=1)[0], dtype=float)
+        return VAR(diff_history).fit(lag_order), lag_order
     except Exception as exc:
-        logging.debug("VAR failed with lag %s: %s; using last observation", lag_order, exc)
-        return history[-1].copy()
+        logging.debug("VAR failed with lag %s: %s", lag_order, exc)
+        return None, lag_order
 
 
-def select_vecm_params(history: np.ndarray, maxlags: int) -> Tuple[int, int]:
+def forecast_var_from_fit(
+    fit,
+    origin_history: np.ndarray,
+    lag_order: int,
+    horizon: int,
+) -> np.ndarray:
+    if fit is None:
+        return origin_history[-1].copy()
+    try:
+        recent_diff = np.diff(origin_history, axis=0)
+        if len(recent_diff) < lag_order:
+            return origin_history[-1].copy()
+        pred_diffs = np.asarray(fit.forecast(recent_diff[-lag_order:], steps=horizon), dtype=float)
+        return origin_history[-1] + pred_diffs.sum(axis=0)
+    except Exception as exc:
+        logging.debug("VAR forecast failed with lag %s: %s; using last observation", lag_order, exc)
+        return origin_history[-1].copy()
+
+
+def vecm_johansen_det_order(deterministic: str) -> int:
+    if deterministic == "n":
+        return -1
+    if "li" in deterministic or "lo" in deterministic:
+        return 1
+    return 0
+
+
+def select_vecm_params(
+    history: np.ndarray,
+    maxlags: int,
+    deterministic: str,
+) -> Tuple[int, int]:
     usable_maxlags = max(1, min(maxlags, len(history) // 5, len(history) - 3))
     try:
-        order = select_order(history, maxlags=usable_maxlags, deterministic="ci")
+        order = select_order(history, maxlags=usable_maxlags, deterministic=deterministic)
         k_ar_diff = int(order.aic) if order.aic is not None and order.aic >= 1 else 1
     except Exception:
         k_ar_diff = 1
 
     try:
-        johansen = coint_johansen(history, det_order=0, k_ar_diff=k_ar_diff)
+        johansen = coint_johansen(
+            history,
+            det_order=vecm_johansen_det_order(deterministic),
+            k_ar_diff=k_ar_diff,
+        )
         rank = int(np.sum(johansen.lr1 > johansen.cvt[:, 1]))
         coint_rank = min(max(rank, 1), history.shape[1] - 1)
     except Exception:
@@ -179,24 +217,33 @@ def select_vecm_params(history: np.ndarray, maxlags: int) -> Tuple[int, int]:
     return k_ar_diff, coint_rank
 
 
-def forecast_vecm_one_step(history: np.ndarray, maxlags: int) -> np.ndarray:
-    k_ar_diff, coint_rank = select_vecm_params(history, maxlags)
+def fit_vecm_model(history: np.ndarray, maxlags: int, deterministic: str):
+    k_ar_diff, coint_rank = select_vecm_params(history, maxlags, deterministic)
     try:
-        fit = VECM(
+        return VECM(
             history,
             k_ar_diff=k_ar_diff,
             coint_rank=coint_rank,
-            deterministic="ci",
-        ).fit()
-        return np.asarray(fit.predict(steps=1)[0], dtype=float)
+            deterministic=deterministic,
+        ).fit(), k_ar_diff
     except Exception as exc:
         logging.debug(
-            "VECM failed with k_ar_diff=%s coint_rank=%s: %s; using last observation",
+            "VECM failed with k_ar_diff=%s coint_rank=%s: %s",
             k_ar_diff,
             coint_rank,
             exc,
         )
-        return history[-1].copy()
+        return None, k_ar_diff
+
+
+def forecast_vecm_from_fit(fit, origin_history: np.ndarray, horizon: int) -> np.ndarray:
+    if fit is None:
+        return origin_history[-1].copy()
+    try:
+        return np.asarray(fit.predict(steps=horizon)[-1], dtype=float)
+    except Exception as exc:
+        logging.debug("VECM forecast failed: %s; using last observation", exc)
+        return origin_history[-1].copy()
 
 
 def history_for_step(
@@ -215,15 +262,25 @@ def history_for_step(
     return values[start:current_end]
 
 
-def forecast_model(
+def fit_model(model_name: str, history: np.ndarray, config: ExperimentConfig):
+    if model_name == "VAR":
+        return fit_var_model(history, config.maxlags)
+    if model_name == "VECM":
+        return fit_vecm_model(history, config.maxlags, config.vecm_deterministic)
+    raise ValueError(f"Unknown model: {model_name}")
+
+
+def forecast_from_fit(
     model_name: str,
-    history: np.ndarray,
-    config: ExperimentConfig,
+    fit,
+    origin_history: np.ndarray,
+    fit_info,
+    horizon: int,
 ) -> np.ndarray:
     if model_name == "VAR":
-        return forecast_var_one_step(history, config.maxlags)
+        return forecast_var_from_fit(fit, origin_history, int(fit_info), horizon)
     if model_name == "VECM":
-        return forecast_vecm_one_step(history, config.maxlags)
+        return forecast_vecm_from_fit(fit, origin_history, horizon)
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -234,32 +291,55 @@ def run_forecasts(config: ExperimentConfig) -> Tuple[pd.DataFrame, pd.DataFrame]
     test_steps = config.test_steps or config.test_size
     if test_steps > config.test_size:
         raise ValueError(f"--test-steps cannot exceed {config.test_size}")
+    if config.forecast_horizon < 1:
+        raise ValueError("--forecast-horizon must be at least 1")
+    if config.forecast_horizon > test_steps:
+        raise ValueError("--forecast-horizon cannot exceed the number of test steps")
+    if config.retrain_interval < 1:
+        raise ValueError("--retrain-interval must be at least 1")
+    forecast_origins = test_steps - config.forecast_horizon + 1
 
     predictions: List[Dict[str, object]] = []
     failures: List[Dict[str, object]] = []
 
     for file_index, (file_name, values) in enumerate(loaded, start=1):
-        actual_test = values[config.train_size : config.train_size + test_steps]
         logging.info("Processing %s (%d/%d)", file_name, file_index, len(loaded))
 
         for window in WINDOWS:
             for model_name in MODELS:
-                logging.info("  %s / %s", model_name, window)
+                logging.info(
+                    "  %s / %s (%d-step forecast, retrain every %d step(s))",
+                    model_name,
+                    window,
+                    config.forecast_horizon,
+                    config.retrain_interval,
+                )
                 model_preds: List[np.ndarray] = []
+                fit = None
+                fit_info = None
+                fitted_at_step = 0
 
-                for step in range(test_steps):
-                    history = history_for_step(values, step, config, window)
+                for step in range(forecast_origins):
+                    origin_history = history_for_step(values, step, config, window)
                     try:
-                        pred = forecast_model(
+                        if step % config.retrain_interval == 0 or fit is None:
+                            fit, fit_info = fit_model(model_name, origin_history, config)
+                            fitted_at_step = step
+
+                        pred = forecast_from_fit(
                             model_name,
-                            history,
-                            config,
+                            fit,
+                            origin_history,
+                            fit_info,
+                            horizon=config.forecast_horizon,
                         )
                     except Exception as exc:
                         failures.append(
                             {
                                 "file": file_name,
-                                "step": step + 1,
+                                "origin_step": step + 1,
+                                "target_step": step + config.forecast_horizon,
+                                "horizon": config.forecast_horizon,
                                 "model": model_name,
                                 "window": window,
                                 "error": repr(exc),
@@ -276,11 +356,15 @@ def run_forecasts(config: ExperimentConfig) -> Tuple[pd.DataFrame, pd.DataFrame]
                     model_preds.append(pred)
 
                 pred_array = np.asarray(model_preds, dtype=float)
-                for step, (actual, pred) in enumerate(zip(actual_test, pred_array), start=1):
+                for step, pred in enumerate(pred_array, start=1):
+                    target_step = step + config.forecast_horizon - 1
+                    actual = values[config.train_size + target_step - 1]
                     predictions.append(
                         {
                             "file": file_name,
-                            "step": step,
+                            "origin_step": step,
+                            "target_step": target_step,
+                            "horizon": config.forecast_horizon,
                             "model": model_name,
                             "window": window,
                             "actual_rtt": actual[0],
@@ -344,7 +428,7 @@ def plot_average_predictions(predictions_df: pd.DataFrame, output_dir: Path) -> 
 
             actual = (
                 predictions_df[predictions_df["window"] == window]
-                .groupby("step")[actual_col]
+                .groupby("target_step")[actual_col]
                 .mean()
                 .sort_index()
             )
@@ -356,14 +440,15 @@ def plot_average_predictions(predictions_df: pd.DataFrame, output_dir: Path) -> 
                         (predictions_df["window"] == window)
                         & (predictions_df["model"] == model_name)
                     ]
-                    .groupby("step")[pred_col]
+                    .groupby("target_step")[pred_col]
                     .mean()
                     .sort_index()
                 )
                 plt.plot(pred.index, pred.values, label=model_name, linewidth=1.6)
 
-            plt.title(f"Average bbr {target} forecast ({window} window)")
-            plt.xlabel("Test step")
+            horizon = int(predictions_df["horizon"].iloc[0]) if "horizon" in predictions_df else 1
+            plt.title(f"Average bbr {target} {horizon}-step forecast ({window} window)")
+            plt.xlabel("Target test step")
             plt.ylabel(target)
             plt.grid(True, alpha=0.3)
             plt.legend()
@@ -381,7 +466,10 @@ def validate_outputs(
 ) -> None:
     expected_files = config.max_files or 50
     expected_steps = config.test_steps or config.test_size
-    expected_prediction_rows = expected_files * len(MODELS) * len(WINDOWS) * expected_steps
+    expected_forecast_origins = expected_steps - config.forecast_horizon + 1
+    expected_prediction_rows = (
+        expected_files * len(MODELS) * len(WINDOWS) * expected_forecast_origins
+    )
     if len(predictions_df) != expected_prediction_rows:
         raise AssertionError(
             f"Expected {expected_prediction_rows} prediction rows, got {len(predictions_df)}"
@@ -439,10 +527,13 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> ExperimentConfig:
     )
     parser.add_argument("--data-dir", default=r"D:\ALL\bbr", type=Path)
     parser.add_argument("--output-dir", default=r"D:\ALL\results_bbr", type=Path)
-    parser.add_argument("--train-size", default=2880, type=int)
-    parser.add_argument("--test-size", default=720, type=int)
-    parser.add_argument("--sliding-size", default=720, type=int)
-    parser.add_argument("--maxlags", default=10, type=int)
+    parser.add_argument("--train-size", default=3240, type=int)
+    parser.add_argument("--test-size", default=360, type=int)
+    parser.add_argument("--forecast-horizon", default=1, type=int)
+    parser.add_argument("--retrain-interval", default=1, type=int)
+    parser.add_argument("--sliding-size", default=360, type=int)
+    parser.add_argument("--maxlags", default=15, type=int)
+    parser.add_argument("--vecm-deterministic", default="n", choices=["n", "ci", "co", "li", "lo"])
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--max-files", default=None, type=int)
     parser.add_argument("--test-steps", default=None, type=int)
@@ -453,8 +544,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> ExperimentConfig:
         output_dir=args.output_dir,
         train_size=args.train_size,
         test_size=args.test_size,
+        forecast_horizon=args.forecast_horizon,
+        retrain_interval=args.retrain_interval,
         sliding_size=args.sliding_size,
         maxlags=args.maxlags,
+        vecm_deterministic=args.vecm_deterministic,
         seed=args.seed,
         max_files=args.max_files,
         test_steps=args.test_steps,
